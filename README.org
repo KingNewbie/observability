@@ -1,0 +1,290 @@
+* Observability exporter of NSO progress-traces
+  This packages consumes NSO progress-trace information and using the OpenTelemetry library can export this to the Jaeger tracing system. It can also directly export metrics to an InfluxDB database.
+
+  This is a proof of concept and is not meant for production use, yet. Feel free to try it out, hack the code and provide feedback but understand that the code comes with no guarantees.
+  [[./nso-trace-in-jaeger.png]]
+
+  Watch the introduction video https://www.youtube.com/watch?v=p45pntWh2JU and the more technical in-depth video https://www.youtube.com/watch?v=qBthBpCTwHg.
+
+
+** Using the test environment for development and testing
+   This repository conforms to the NID (NSO-in-Docker [[https://gitlab.com/nso-developer/nso-docker/]] skeleton for a package repository. That means, as long as you have the necessary base images built, you can start a test environment simply by doing ~make build testenv-start~. See the nso-docker repository for more details.
+
+   Since we depend on two other repositories, those will need to be built first;
+   - ~export NSO_VERSION=5.4.1~ (or something newer perhaps)
+   - ~export NSO_IMAGE_PATH=my-registry.example.com/nso-docker/~ (set to URL for your nso-docker images)
+   - ~git clone https://gitlab.com/nso-developer/ned-ietf-yang.git~
+   - ~make -C ned-ietf-yang build tag-release~
+   - Then in this repo: ~make build~
+   - Finally to start the test environment: ~make testenv-start~
+
+   The test environment includes the following containers:
+   - NSO
+   - Elasticsearch
+     - backend database for Jaeger
+   - Jaeger collector
+     - receives data from Jaeger agents and stores in database
+   - Jaeger query
+     - web UI for Jaeger
+   - Jaeger agent
+     - receives data from an application (NSO in this case) and sends it to the collector
+     - it is customary to run this on localhost
+     - using --network=container:$(CNT_PREFIX)-nso to run in same network namespace as NSO, i.e. "localhost"
+   - Kibana
+     - web UI for Elasticsearch
+     - good for exploring data with ad-hoc queries and similar
+   - InfluxDB
+     - a time series database used to store metrics
+   - Grafana
+     - web UI that can also visualize traces (using the same UI component as Jaeger, so looks identical)
+     - visualizes metrics in InfluxDB
+     - the default dashboard (configured by the ~make testenv-prepare-grafana~ target) will show some NSO metrics
+
+   Starting the test environment looks something like the following. Closer to the end, you will find a "Visit the following URL..." message that has the IP addresses of various dashboards. Browse there to view your progress traces.
+
+   #+BEGIN_SRC text
+     kll@ThinkYoga:~/tailf/observability-exporter$ make testenv-start
+     docker network inspect testenv-observability-exporter-5.4-kll >/dev/null 2>&1 || docker network create testenv-observability-exporter-5.4-kll
+     8a261514c2e98f34a186f49424167093413117cc1ace6c7a612024cc2da043ad
+     docker container inspect testenv-observability-exporter-5.4-kll-nso >/dev/null 2>&1 || docker run -td --name testenv-observability-exporter-5.4-kll-nso --network-alias nso --network testenv-observability-exporter-5.4-kll --label testenv-observability-exporter-5.4-kll --label nidtype=nso --volume /var/opt/ncs/packages -e ADMIN_PASSWORD=NsoDocker1337 ${NSO_EXTRA_ARGS} observability-exporter/testnso:5.4-kll
+     ffc981160afe699126033450b467e54afa018dc7e3964ab23700c96efa718acf
+     make testenv-start-extra
+     make[1]: Entering directory '/home/kll/tailf/observability-exporter'
+
+     == Starting repository specific testenv
+     -- Starting elasticsearch
+     docker run -td --name testenv-observability-exporter-5.4-kll-es --network-alias es --network testenv-observability-exporter-5.4-kll --label testenv-observability-exporter-5.4-kll \
+       -e "discovery.type=single-node" elasticsearch:7.8.0
+     1de9029569bfa41774647f4c23a45d3602fcaf07c3f2411f368b1040ed42bd5a
+     -- Starting Kibana
+     docker run -td --name testenv-observability-exporter-5.4-kll-kibana --network-alias kibana --network testenv-observability-exporter-5.4-kll --label testenv-observability-exporter-5.4-kll kibana:7.8.0
+     07f0dc6199e3c2c791c787c8c37806fb21a1ff05cf3cc50c2d54f0bb42adb7ff
+     -- Starting Grafana
+     docker run -td --name testenv-observability-exporter-5.4-kll-grafana --network-alias grafana --network testenv-observability-exporter-5.4-kll --label testenv-observability-exporter-5.4-kll grafana/grafana
+     2d2f41b1efbbe67501f86ab95dd035c9f8d66238557964d484de91ed1379884b
+     -- Starting Jaeger collector
+     docker run -td --name testenv-observability-exporter-5.4-kll-jaeger-collector --network-alias jaeger-collector --network testenv-observability-exporter-5.4-kll --label testenv-observability-exporter-5.4-kll \
+       -e SPAN_STORAGE_TYPE=elasticsearch -e ES_SERVER_URLS=http://es:9200/ --restart=always jaegertracing/jaeger-collector:1.16
+     b5bff268c0ed49dda6c327869031886015a3063bd0e092c5ec33d8d6e8509bfe
+     -- Starting Jaeger agent
+     docker run -td --name testenv-observability-exporter-5.4-kll-jaeger-agent --network=container:testenv-observability-exporter-5.4-kll-nso --label testenv-observability-exporter-5.4-kll \
+       jaegertracing/jaeger-agent:1.16 --reporter.grpc.host-port=jaeger-collector:14250
+     -- Starting Jaeger query
+     docker run -td --name testenv-observability-exporter-5.4-kll-jaeger-query --network-alias jaeger-query --network testenv-observability-exporter-5.4-kll --label testenv-observability-exporter-5.4-kll -p 16686:16686 -p 16687:16687 \
+       -e SPAN_STORAGE_TYPE=elasticsearch -e ES_SERVER_URLS=http://es:9200/ --restart=always jaegertracing/jaeger-query:1.16
+     57ec80c3fb6ff98da470f23dd4cc13db65cb3b96596b23a691d3abee90129f8f
+     #docker run -td --name testenv-observability-exporter-5.4-kll-jaeger --network-alias jaeger --network testenv-observability-exporter-5.4-kll --label testenv-observability-exporter-5.4-kll jaegertracing/all-in-one:latest
+     docker exec -t testenv-observability-exporter-5.4-kll-nso bash -lc 'ncs --wait-started 600'
+     make testenv-runcmdJ CMD="unhide debug\nconfigure\nedit progress export\n set enabled\n set reporting-host jaeger\ncommit"
+     make[2]: Entering directory '/home/kll/tailf/observability-exporter'
+     docker exec -t testenv-observability-exporter-5.4-kll-nso bash -lc 'echo -e "unhide debug\nconfigure\nedit progress export\n set enabled\ncommit" | ncs_cli -Ju admin'
+     Commit complete.
+     make[2]: Leaving directory '/home/kll/tailf/observability-exporter'
+     make testenv-print-jaeger-address
+     make[2]: Entering directory '/home/kll/tailf/observability-exporter'
+     Visit the following URLs in your web browser to reach respective system:
+     Jaeger    : http://127.0.0.1:49255
+     Kibana    : http://127.0.0.1:49245
+     Grafana   : http://127.0.0.1:49246
+     InfluxDB  : http://127.0.0.1:49250
+     make[2]: Leaving directory '/home/kll/tailf/observability-exporter'
+     make[1]: Leaving directory '/home/kll/tailf/observability-exporter'
+     docker exec -t testenv-observability-exporter-5.4-kll-nso bash -lc 'ncs --wait-started 600'
+     kll@nuc:~/tailf/observability-exporter$
+   #+END_SRC
+
+   In the test environment, any transaction you perform will be captured and exported to jaeger and influxdb and thus become visible - configure away!
+
+*** Including the observability stack in your projects
+    You can also use the the same containers that are part of the test environment in this project in your own projects. In this repository you will find the file =testenvs/common/nso_observability.mk=. Copy the file to your project =testenv/common= directory and include the file in your makefiles. Then you can use the same ~nsobs-*~ targets we use here to create the containers and configure NSO to export the progress traces. The most common targets are:
+    - ~nsobs-start~: starts all the observability containers (listed above).
+    - ~nsobs-prepare~: set up the Grafana dashboard. Will download the latest version of the dashboard from https://grafana.com/grafana/dashboards/14353 by default. You can override this by placing your own dashboard JSON in =testenvs/common/props/dashboard-nso.json.in=.
+    - ~nsobs-config-nso~: set up NSO to export trace data to all the collectors.
+    - ~nsobs-stop~: stop all the observability containers started with ~nsobs-start~.
+
+    We suggest you include these targets in your own testenv ~start~ target. By default the observability stack will *NOT* run in CI (determined by checking for the existence of the ~CI~ environment variable), but will run for local testenvs. You can always override this behavior by setting the ~NSO_OBSERVABILITY~ environment variable to either ~true~ or ~false~.
+
+** Production Usage
+   Besides the test environment mentioned there are two main paths to using this code:
+   - load the =observability-exporter= NSO package for real time export of tracing information
+     - this is only possible on NSO 5.4 and later
+       - NSO 5.4 introduced a new format for progress-trace & allow proper subscription via the notification API
+   - manually running =ptrace.py= for batch processing of CSV files containing progress-traces
+     - this is compatible with NSO 5.3 and earlier
+     - a backwards compatibility shim is used internally to uplift older CSV files to look like progress-trace events as emitted by NSO 5.4 and later
+
+*** Real-time export on NSO 5.4 and later
+    Load the =observability-exporter= into your NSO system.
+
+    Configure the export of progress-trace data. The configuration lives under ~/progress/export~, which is hidden, thus unhide it first:
+
+    #+BEGIN_SRC text
+      user@ncs> unhide debug
+      user@ncs> configure
+      user@ncs% edit progress export
+      user@ncs% set enabled
+      user@ncs% set jaeger host HOSTNAME-OF-JAEGER-AGENT
+      user@ncs% set influxdb host HOSTNAME-OF-INFLUXDB
+      user@ncs% set influxdb database INFLUXDB-DATABASE
+      user@ncs% commit
+      user@ncs% exit
+      user@ncs> request packages reload
+    #+END_SRC
+
+    Replace ~HOSTNAME-OF-JAEGER-AGENT~ with the IP address or hostname of your Jaeger agent. The exporter actually defaults to being enabled so it will start exporting data as soon as it is loaded. The reporting-host defaults to 'localhost', so if you are running jaeger-agent locally, perhaps as a side car container, then you don't have to configure anything at all. Just load the package!
+    
+    You can also override the port where Jaeger is listening on. For InfluxDB there are a number of options; hostname, port, username, password and database. Port is 8086 per default. You need to set the host to something useful. Database name defaults to =nso=. Credentials are optional (influxdb can run without authentication) but is naturally subject to your own deployment.
+    
+    The package reads its configuration on startup so after changing the configuration we must restart the exporter by doing a package reload.
+
+    You can run a side car container, that is a container that shares the network namespace with NSO, with ~docker run ... --network=container:NAME_OF_NSO_CONTAINER ...~. Also see the Makefile for how we start up the jaeger-agent container in the =testenv=.
+
+    Perform another transaction and it should be immediately exported and visible in Jaeger and InfluxDB (well Grafana)
+
+*** Extra tags
+    Is it possible add extra tags to the exported spans. This is useful to distinguish exported data from different deployed systems. For example, when using observability-exporter to export data in a CI system to a persistent central collector, by adding a tag like =CI_PIPELINE_ID=1234=, the data from different CI pipelines can be easily kept apart.
+
+*** Manual batch processing
+    This should be possible on 5.3 and earlier as well as on 5.4 and later, however, given that it is possible to do real-time export on NSO 5.4, that is recommended when possible. Still, for situations where you might already have collected a CSV file, this could be a useful use case.
+
+    Simply run the ptrace file and provide the CSV file and the jaeger host. If you've started Jaeger by starting the =testenv= (with ~make testenv-start~) then you can get the IP address of it with ~make nsobs-print-ui-addresses~.
+    #+BEGIN_SRC text
+      python3 packages/observability-exporter/python/observability_exporter/ptrace.py --jaeger-host localhost --csv my-traces.csv --export-jaeger
+    #+END_SRC
+
+    You will need to have a few Python libraries installed. They are listed in =packages/observability-exporter/src/requirements.txt= and can easily be installed with ~pip3 install -r packages/observability-exporter/src/requirements.txt~
+
+    To configure CSV export of progress-trace in NSO:
+
+    #+BEGIN_SRC text
+      user@ncs> unhide debug
+      user@ncs> configure
+      user@ncs% edit progress trace my-trace
+      user@ncs% set enabled
+      user@ncs% set destination file my-trace.csv
+      user@ncs% set verbosity very-verbose
+      user@ncs% commit
+    #+END_SRC
+
+    If you don't have another jaeger instance already running, you can start one with ~docker run -itd --name my-jaeger -p 6831:6831/udp -p 16686:16686 jaegertracing/all-in-one:latest~ and export to it by setting ~--jaeger-host localhost~. Then point your web browser to =http://localhost:16686/=.
+
+    If you are importing older data it seems like you might be unable to find it in Jaeger. In the Jaeger trace search, you first have to pick a "service", which in this case is called "NSO" but it seems like Jaeger only looks for services in the service index for the current day (information is internally sharded per day) and so if you have imported a progress trace CSV file from an older date, Jaeger doesn't see that there is a "NSO" service. This can be worked around by starting the complete environment and doing like ~make testenv-test-simple~, which will then create some trace data in Jaeger, making "NSO" pop up and thus searchable.
+
+** Thoughts on using this data
+   Jaeger has an excellent UI component for visualizing traces. That very same component is actually reused by Grafana, so you can get in essence the same view in Grafana, although Grafana randomizes color selections for the spans so it won't be as deterministic. This view is excellent to get an understanding of a specific transaction, that is, once you know about a "interesting" transaction/trace (they are currently mapped 1:1) you can get a good understanding very quickly by looking at the trace outline.
+
+   The search part of Jaeger is pretty bleak. You can just do some very basic filtering on things like time range, min and max duration of the whole trace (not individual spans) or by tag values. It works okay when you know what you are looking for, like a transaction that takes more than 3 seconds. It doesn't work well at all when you just want to explore the data starting from a high level perspective and drill down.
+
+   Let's say we want to group transactions by something and get a histogram to determine if we have any outliers, like a tail of transactions where suddenly some transactions take 10x the time of their siblings - that's just not possible with Jaeger. This is the main driving force behind switching the backend of this testenv to Elasticsearch (ES), so we can query the data using Kibana. Kibana is pretty much built for this type of ad-hoc exploration of data. I currently don't have any ready to go queries but hope we can do interesting things with it. Some ideas:
+   - plot =holding transaction lock= span with ~sum(duration)~ on Y with startTimeMillis on X-axis
+     - should give a good overview of where we have long running transactions
+   - ratio of time where transaction-lock is held vs when it is not held
+     - this is a measure of how busy the NSO system is overall
+     - a higher number alone might not be indicative of any problems but as this creeps up we might get closer to the capacity limit of the NSO system
+       - in particular with the back pressure (see below), this could indicate when NSO needs to be scaled up
+     - the =holding transaction lock= span shows the time when it is held
+   - a gauge showing the currently ongoing =grabbing transaction lock= spans
+     - this shows the "back pressure", i.e. how many on-going transactions that want to grab the transaction lock but that are queued up since only one transaction can hold the lock
+   - of the total time spent in =holding transaction lock=, split down by:
+     - time spent in =create= (well, =applying transforms and transactions hooks=)
+     - time spent in (XPath) validation (dunno what the span name is from top of my head)
+     - time spent in device interaction
+     - this type of break down could show us if enabling commit queues would be an easy win to increase transactional throughput
+       - could we also analyze the device interaction part to see the devices themselves?
+         - if all changes are going to few devices then using commit queues won't help
+   - time spent in the =create= span, broken down (bucketed/aggregated/grouped by) service, i.e. not service instance but service type
+     - shows what service types are slow
+   - number of transactions to running and operational
+   - histogram to show =create= span per service instance, filtered on a service type
+     - looking across all services probably doesn't make sense because different services take different amount of time
+     - better to compare within one service type to see if we have outliers and then analyze them by looking at the trace
+
+   Overall we want to draw the attention of developers towards their slow code. The attention of operational folks to how NSO is behaving, should LSA be sharded further or commit queues enabled?
+
+*** What is a trace?
+    NSO transactions are mapped to traces, so there is a 1:1 mapping between a trace in Jager and transactions in NSO.
+
+*** Visualizing reactive service
+    Reactive Fastmap services use multiple transactions to carry out work, thus it is relevant to visualize multiple transactions in one coherent view.
+
+    A past experiment ([[https://github.com/nso-developer/progress2span]]) per default mapped user sessions to traces, thus multiple transactions that happened within the same user session would appear as one trace which is great for a number of scenarios, such as reactive fastmap. However, for really long lived user sessions, which are common for OSS systems that keep a persistent session or for background workers - NSO components that do work over a long time will keep one "permanent" user session and open many transactions within it. One such an example of a background worker had a 7 week long user session with tens of thousands of transactions. The trace looked like garbage in Jaeger.
+
+    As technical people we might sometimes not focus on aestethics enough and instead prioritize elegant parsing of data or similar more hard and concrete aspects. Aestethics are important though. It is the visual nature of these traces - they are pretty after all - that makes it easy to gain some insight by just glancing at it - you don't get that by glancing at a thousand line CSV file.
+
+    User sessions are unbounded in length. Mapping traces to user sessions will thus result in potentially very large and unwieldy traces. Not a good idea.
+
+    Transactions are potentially unbounded in length too, but much less commonly so. People will naturally optimize and write code in such a way that transactions complete in a fairly deterministic and relatively short amount of time.
+
+    Another problem with mapping user sessions to traces, for the purpose of visualizing reactive fastmap services, is that a single transaction could be used to create many different reactive services and we now get all these intermingled in a very large trace.
+
+    What we really want is to get all the transactions that touched a particular service. The idea of having a persistent traceable id associated with services has been floated, but we can realize that we already have one. The keypath / path to the service is already a unique identifier of a service. If we could simply search on the service identifier, we could get all the transactions related to it and plot those as one trace! Nice!
+
+    As far as I am aware, it is not possible to combine traces on the fly in this way in Jaeger. We would need to add an extra processing step that combines traces in this fashion and materializes them in ES. That raises the question if we want to keep duplicate data in the database, since a transaction will appear in multiple traces. I think that is fine. As long as we add some tag that classifies what it is, we can filter on this at query time to either only get raw data or the combined view traces. Combining on service identifier could make transactions appear in way more than 2 traces if a transaction was used to create multiple services.
+
+    Another problem arises with potentially very large services or those that encounter some unexpected event leading to execution over a very long span of time. Very large services are self-explanatory in the sense that the trace might become so large that it is unwieldy and doesn't provide that "insight at a glance" that we are looking for.
+
+    Very long running services aren't necessarily long running per design, for example; let's say we want to start a virtual router, so we ask NFVO/VIM/ESC to start a virtual machine for us. Then we will wait for the VM to be started. If there are no compute nodes available to us, we will simply sit idling. Perhaps a compute node was broken and it takes 3 months to have it fixed (COVID et al) - that means the reactive service will spans multiple months, again potentially making the trace visually fugly and generally non-helpful.
+
+** Instrumenting your create callback
+   While the create callback has its own span in NSO progress-trace and
+   subsequently a span is emitted in the trace data, it is sometimes desirable
+   to further instrument the create callback to expose its internals. In this
+   picture, there is a =sleep configured time= time inside of =create= and
+   there's a further child span called =nested random sl...=.
+
+    [[./emit-nested-span.png]]
+
+   It is possible to emit your own progress trace message using the
+   report_service_progress_start and corresponding stop function. A Python
+   context manager can be easily written to wrap this up in a convenient shape.
+   Here is the slowness example service and the =ptrace_service= context manager
+   used to emit the spans shown above from within its =create= callback. Also
+   note how the spans can be nested.
+
+   #+BEGIN_SRC python
+     # -*- mode: python; python-indent: 4 -*-
+     from contextlib import contextmanager
+     import random
+     import time
+
+     import ncs
+     from ncs.application import Service
+
+     @contextmanager
+     def ptrace_service(service, message, verbosity=ncs.VERBOSITY_NORMAL):
+         t = ncs.maagic.get_trans(service)
+         progress = t.report_service_progress_start(verbosity, message, service._path, '')
+         try:
+             yield
+         finally:
+             t.report_service_progress_stop(progress)
+
+
+     class ServiceCallbacks(Service):
+         @Service.create
+         def cb_create(self, tctx, root, service, proplist):
+             with ptrace_service(service, 'sleep configured time'):
+                 time.sleep(float(service.create_slowness))
+
+                 rand_max = float(service.random_create_slowness)*1000
+                 if rand_max > 0:
+                     with ptrace_service(service, 'nested random sleep'):
+                         time.sleep(random.randrange(0, int(rand_max))/1000)
+
+
+     class Main(ncs.application.Application):
+         def setup(self):
+             self.register_service('slowness-servicepoint', ServiceCallbacks)
+   #+END_SRC
+
+   Don't put instance specific data in the message. It should be a generic
+   message.
+
+** commit dry-run
+   What happens with dry-runs? Do they show up in progress-traces and the resulting traces?
+
+   Yes, they do. The only different with a dry-run compared to a normal commit is that it does an =abort= at the end instead of committing the transaction. It can look like this:
+
+   [[./trace-dry-run.png]]
+
+   This might feel strange and some have suggested that a commit dry-run should look visually different or not show up at all! But remember, tracing is about understanding what the system is doing and spending time on. Running a ~commit dry-run~ also consumes system resources and for example acquires locks, so it is important that it shows up in the statistics.
